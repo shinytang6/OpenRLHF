@@ -13,6 +13,7 @@ from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean
 from openrlhf.trainer.ray.launcher import PPORayActorGroup
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.remote_rm_utils import remote_rm_fn_ray
+from openrlhf.utils.rl_logging_board import save_rollout_data_for_rl_logging_board
 
 logger = init_logger(__name__)
 
@@ -59,6 +60,7 @@ class Experience:
     action_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
     kl: Optional[torch.Tensor] = None
+    token_rewards: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def to_device(self, device: torch.device):
@@ -71,6 +73,7 @@ class Experience:
         self.attention_mask = to(self.attention_mask, device)
         self.action_mask = to(self.action_mask, device)
         self.kl = to(self.kl, device)
+        self.token_rewards = to(self.token_rewards, device)
         self.info = {key: to(value, device) for key, value in self.info.items()}
         return self
 
@@ -84,6 +87,7 @@ class Experience:
         self.attention_mask = pin_memory(self.attention_mask)
         self.action_mask = pin_memory(self.action_mask)
         self.kl = pin_memory(self.kl)
+        self.token_rewards = pin_memory(self.token_rewards)
         self.info = {key: pin_memory(value) for key, value in self.info.items()}
         return self
 
@@ -221,7 +225,7 @@ class RemoteExperienceMaker(ABC):
 
     @torch.no_grad()
     def make_experience_list(
-        self, all_prompts: Union[str, List[str]], all_labels, **generate_kwargs
+        self, all_prompts: Union[str, List[str]], all_labels, global_step: int = 0, **generate_kwargs
     ) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
@@ -248,7 +252,7 @@ class RemoteExperienceMaker(ABC):
         experiences = self.make_experience(rollout_samples)
 
         # Process experiences (reward shaping, etc.)
-        experiences = self.compute_advantages_and_returns(experiences)
+        experiences = self.compute_advantages_and_returns(experiences, global_step)
         return experiences
 
     @torch.no_grad()
@@ -439,7 +443,7 @@ class RemoteExperienceMaker(ABC):
 
     @torch.no_grad()
     def compute_advantages_and_returns(
-        self, experiences: List[Experience], **kwargs
+        self, experiences: List[Experience], global_step: int = 0, **kwargs
     ) -> Tuple[List[Experience], List[torch.Tensor]]:
         """
         Process experiences, this can be used to filter out some experiences or do some processing on the rewards.
@@ -479,6 +483,7 @@ class RemoteExperienceMaker(ABC):
                 action_mask=experience.action_mask,
                 reward_clip_range=args.reward_clip_range,
             )
+            experience.token_rewards = reward
 
             if self.advantage_estimator == "gae":
                 experience.advantages, experience.returns = self.get_advantages_and_returns(
@@ -512,6 +517,9 @@ class RemoteExperienceMaker(ABC):
             experience.info["return"] = return_sums
             # remove unnecessary info
             experience.kl = None
+
+            if args.use_rl_logging_board:
+                save_rollout_data_for_rl_logging_board(experience, args, self.tokenizer, global_step)
 
         # Normalize advantages across all experiences
         if self.args.advantage_estimator not in ["group_norm", "dr_grpo"]:
